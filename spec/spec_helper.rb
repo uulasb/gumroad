@@ -8,6 +8,7 @@ require File.expand_path("../config/environment", __dir__)
 require "capybara/rails"
 require "capybara/rspec"
 require "rspec/rails"
+require "active_job/test_helper"
 require "paper_trail/frameworks/rspec"
 require "pundit/rspec"
 Dir.glob(Rails.root.join("spec", "support", "**", "*.rb")).each { |f| require f }
@@ -57,6 +58,7 @@ def configure_vcr
     config.ignore_hosts "storage.googleapis.com"
     config.ignore_localhost = true
     config.configure_rspec_metadata!
+    config.allow_http_connections_when_no_cassette = true
     config.debug_logger = $stdout if ENV["VCR_DEBUG"]
     config.default_cassette_options[:record] = BUILDING_ON_CI ? :none : :once
     config.filter_sensitive_data("<AWS_ACCOUNT_ID>") { GlobalConfig.get("AWS_ACCOUNT_ID") }
@@ -124,7 +126,7 @@ RSpec.configure do |config|
   config.include Devise::Test::ControllerHelpers, type: :controller
   config.include Devise::Test::ControllerHelpers, type: :helper
   config.include FactoryBot::Syntax::Methods
-  config.pattern = "**/*_spec.rb"
+  config.include ActiveJob::TestHelper
   config.raise_errors_for_deprecations!
   config.use_transactional_fixtures = true
   config.filter_run_when_matching :focus

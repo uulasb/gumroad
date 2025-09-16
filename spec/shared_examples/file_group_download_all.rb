@@ -3,6 +3,10 @@
 require "spec_helper"
 
 RSpec.shared_examples_for "a product with 'Download all' buttons on file embed groups" do
+  around do |ex|
+    perform_enqueued_jobs { ex.run }
+  end
+
   before do
     file1 = create(:product_file, display_name: "File 1")
     file2 = create(:product_file, display_name: "File 2")
@@ -104,9 +108,11 @@ RSpec.shared_examples_for "a product with 'Download all' buttons on file embed g
     expect_any_instance_of(SignedUrlHelper).to receive(:signed_download_url_for_s3_key_and_filename).with(@page2_folder_archive.s3_key, @page2_folder_archive.s3_filename).and_return("https://example.com/zip-archive.zip")
     within_file_group("Page 2 folder") do
       select_disclosure "Download all" do
+        using_wait_time(Capybara.default_max_wait_time) do
+          expect(page).to have_link(/Download all/i, wait: 10)
+        end
         click_on "Download as ZIP"
       end
-      wait_for_ajax
     end
   end
 
@@ -117,9 +123,11 @@ RSpec.shared_examples_for "a product with 'Download all' buttons on file embed g
 
     within_file_group("only 1 downloadable file") do
       select_disclosure "Download all" do
+        using_wait_time(Capybara.default_max_wait_time) do
+          expect(page).to have_link(/Download all/i, wait: 10)
+        end
         click_on "Download file"
       end
-      wait_for_ajax
     end
   end
 
@@ -130,6 +138,9 @@ RSpec.shared_examples_for "a product with 'Download all' buttons on file embed g
 
     within_file_group("folder 1") do
       select_disclosure "Download all" do
+        using_wait_time(Capybara.default_max_wait_time) do
+          expect(page).to have_link(/Download all/i, wait: 10)
+        end
         click_on "Download as ZIP"
         expect(page).to have_button("Zipping files...", disabled: true)
       end
@@ -158,8 +169,10 @@ RSpec.shared_examples_for "a product with 'Download all' buttons on file embed g
 
     within_file_group("folder 1") do
       select_disclosure "Download all" do
+        using_wait_time(Capybara.default_max_wait_time) do
+          expect(page).to have_link(/Download all/i, wait: 10)
+        end
         click_on "Save to Dropbox"
-        wait_for_ajax
       end
     end
   end
