@@ -1,3 +1,4 @@
+import debounce from "lodash/debounce";
 import throttle from "lodash/throttle";
 import * as React from "react";
 import { createCast } from "ts-safe-cast";
@@ -12,6 +13,26 @@ import { TranscodingNoticeModal } from "$app/components/Download/TranscodingNoti
 import { useRunOnce } from "$app/components/useRunOnce";
 
 const LOCATION_TRACK_EVENT_DELAY_MS = 10_000;
+
+// Recovery constants
+const MAX_RECOVERY_ATTEMPTS = 3;
+const BUFFERING_STALL_TIMEOUT_MS = 5000;
+const VISIBILITY_RECOVERY_THRESHOLD_MS = 5 * 60 * 1000;
+const NEAR_END_THRESHOLD_S = 1.5;
+const RECOVERY_DEBOUNCE_MS = 250;
+
+// Recovery event types
+interface JWPlayerErrorEvt {
+  code?: number;
+  error?: { code?: number };
+}
+interface JWPlayerTimeEvt {
+  position: number;
+  duration: number;
+}
+interface JWPlayerSeekEvt {
+  offset: number;
+}
 
 type SubtitleFile = {
   file: string;
@@ -59,6 +80,14 @@ export const VideoStreamPlayer = ({
       let isInitialSeekDone = false;
       const playlist = initialPlaylist;
 
+      // Recovery state variables
+      let lastKnownPosition = 0;
+      let lastKnownDuration = 0;
+      let recoveryAttempts = 0;
+      let recovering = false;
+      let hiddenAt: number | null = null;
+      let stallTimer: ReturnType<typeof setTimeout> | null = null;
+
       const player = await createJWPlayer(playerId, {
         width: "100%",
         height: "100%",
@@ -98,18 +127,80 @@ export const VideoStreamPlayer = ({
 
       const throttledTrackMediaLocation = throttle(trackMediaLocation, LOCATION_TRACK_EVENT_DELAY_MS);
 
+      // Recovery functions
+      const reloadAndResume = () => {
+        if (recovering || recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) return;
+        recovering = true;
+        recoveryAttempts += 1;
+        (window as any).__RECOVERY_ATTEMPTS__ = recoveryAttempts;
+        (window as any).__EXPIRE_HLS__ = false;
+
+        if (typeof (player as any).__armAutoResume === "function") {
+          (player as any).__armAutoResume();
+        }
+
+        const currentItem = player.getPlaylistItem();
+        const pos = lastKnownPosition;
+        player.load([currentItem]);
+        player.once("ready", () => {
+          if (pos > 0) player.seek(pos);
+          try {
+            player.play(true);
+          } catch (_) {}
+          setTimeout(() => {
+            try {
+              player.play(true);
+            } catch (_) {}
+          }, 100);
+          recovering = false;
+        });
+      };
+
+      const debouncedReloadAndResume = debounce(reloadAndResume, RECOVERY_DEBOUNCE_MS);
+
+      // Visibility change handler
+      const handleVisibilityChange = () => {
+        if (document.hidden) {
+          hiddenAt = Date.now();
+          return;
+        }
+        const t = hiddenAt;
+        hiddenAt = null;
+        const isTestExpiry = (window as any).__EXPIRE_HLS__ === true;
+        const longPause = t && Date.now() - t >= VISIBILITY_RECOVERY_THRESHOLD_MS;
+        if (isTestExpiry || longPause) {
+          debouncedReloadAndResume();
+          try {
+            if (player && typeof player.play === "function") player.play(true);
+          } catch (_) {}
+          setTimeout(() => {
+            try {
+              if (player && typeof player.play === "function") player.play(true);
+            } catch (_) {}
+          }, 150);
+        } else {
+          try {
+            if (player && typeof player.play === "function") player.play(true);
+          } catch (_) {}
+        }
+      };
+
+      document.addEventListener("visibilitychange", handleVisibilityChange);
+
       player.on("ready", () => {
         player.playlistItem(index_to_play);
       });
 
-      player.on("seek", (ev) => {
+      player.on("seek", (ev: JWPlayerSeekEvt) => {
         trackMediaLocation(ev.offset);
         updateLocalMediaLocation(ev.offset, player.getDuration());
       });
 
-      player.on("time", (ev) => {
+      player.on("time", (ev: JWPlayerTimeEvt) => {
         throttledTrackMediaLocation(ev.position);
         updateLocalMediaLocation(ev.position, ev.duration);
+        lastKnownPosition = ev.position || 0;
+        lastKnownDuration = ev.duration || 0;
       });
 
       player.on("complete", () => {
@@ -146,6 +237,48 @@ export const VideoStreamPlayer = ({
         }
         isInitialSeekDone = true;
       });
+
+      // Recovery event listeners
+      player.on("error", (event: JWPlayerErrorEvt) => {
+        const code = event.code || event.error?.code;
+        if (code === 403 || code === 410) {
+          debouncedReloadAndResume();
+        }
+      });
+
+      player.on("buffer", () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        stallTimer = setTimeout(() => {
+          if (player.getState && player.getState() === "buffering") {
+            debouncedReloadAndResume();
+          }
+        }, BUFFERING_STALL_TIMEOUT_MS);
+      });
+
+      player.on("playing", () => {
+        if (stallTimer) {
+          clearTimeout(stallTimer);
+          stallTimer = null;
+        }
+      });
+
+      player.on("idle", () => {
+        const nearEnd = lastKnownDuration > 0 && lastKnownPosition >= lastKnownDuration - NEAR_END_THRESHOLD_S;
+        if (!nearEnd) {
+          debouncedReloadAndResume();
+        }
+      });
+
+      // Cleanup function
+      return () => {
+        if (stallTimer) clearTimeout(stallTimer);
+        debouncedReloadAndResume.cancel();
+        throttledTrackMediaLocation.cancel();
+        document.removeEventListener("visibilitychange", handleVisibilityChange);
+        try {
+          if (player && typeof player.remove === "function") player.remove();
+        } catch (_) {}
+      };
     };
 
     void createPlayer();
