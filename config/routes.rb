@@ -1023,6 +1023,11 @@ Rails.application.routes.draw do
     # test endpoints used by pingdom and alike
     get "/_/test/outgoing_traffic", to: "test#outgoing_traffic"
 
+    if Rails.env.test?
+      get "/_/test/video_player", to: "test#video_player_test"
+      get "/test-video-player.js", to: "test#test_video_player_js"
+    end
+
     get "/(*path)", to: "application#e404_page" unless Rails.env.development?
   end
 

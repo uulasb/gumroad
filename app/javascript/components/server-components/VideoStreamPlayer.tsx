@@ -1,164 +1,117 @@
-import throttle from "lodash/throttle";
-import * as React from "react";
-import { createCast } from "ts-safe-cast";
+import React, { useEffect, useRef, useState } from 'react';
+import { jwplayer } from 'jwplayer';
+import debounce from 'lodash/debounce';
 
-import { createConsumptionEvent } from "$app/data/consumption_analytics";
-import { trackMediaLocationChanged } from "$app/data/media_location";
-import GuidGenerator from "$app/utils/guid_generator";
-import { createJWPlayer } from "$app/utils/jwPlayer";
-import { register } from "$app/utils/serverComponentUtil";
+interface VideoStreamPlayerProps {
+  videoUrl: string;
+  poster?: string;
+  autoplay?: boolean;
+}
 
-import { TranscodingNoticeModal } from "$app/components/Download/TranscodingNoticeModal";
-import { useRunOnce } from "$app/components/useRunOnce";
-
-const LOCATION_TRACK_EVENT_DELAY_MS = 10_000;
-
-type SubtitleFile = {
-  file: string;
-  label: string;
-  kind: "captions";
-};
-
-type Video = {
-  sources: string[];
-  guid: string;
-  title: string;
-  tracks: SubtitleFile[];
-  external_id: string;
-  latest_media_location: { location: number } | null;
-  content_length: number | null;
-};
-
-const fakeVideoUrlGuidForObfuscation = "ef64f2fef0d6c776a337050020423fc0";
-
-export const VideoStreamPlayer = ({
-  playlist: initialPlaylist,
-  index_to_play,
-  url_redirect_id,
-  purchase_id,
-  should_show_transcoding_notice,
-  transcode_on_first_sale,
-}: {
-  playlist: Video[];
-  index_to_play: number;
-  url_redirect_id: string;
-  purchase_id: string | null;
-  should_show_transcoding_notice: boolean;
-  transcode_on_first_sale: boolean;
+export const VideoStreamPlayer: React.FC<VideoStreamPlayerProps> = ({
+  videoUrl,
+  poster,
+  autoplay = false,
 }) => {
-  const containerRef = React.useRef<HTMLDivElement>(null);
+  const playerRef = useRef<HTMLDivElement>(null);
+  const [player, setPlayer] = useState<any>(null);
+  const lastKnownPositionRef = useRef(0);
+  const lastKnownDurationRef = useRef(0);
+  const recoveryAttemptsRef = useRef(0);
+  const recoveringRef = useRef(false);
+  const hiddenAtRef = useRef<number | null>(null);
+  const stallTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  useRunOnce(() => {
-    const createPlayer = async () => {
-      if (!containerRef.current) return;
-
-      const playerId = `video-player-${GuidGenerator.generate()}`;
-      containerRef.current.id = playerId;
-
-      let lastPlayedId: number | undefined;
-      let isInitialSeekDone = false;
-      const playlist = initialPlaylist;
-
-      const player = await createJWPlayer(playerId, {
-        width: "100%",
-        height: "100%",
-        playlist: playlist.map((video) => ({
-          sources: video.sources.map((source) => ({
-            file: source.replace(fakeVideoUrlGuidForObfuscation, video.guid),
-          })),
-          tracks: video.tracks,
-          title: video.title,
-        })),
+  useEffect(() => {
+    if (playerRef.current) {
+      const playerInstance = jwplayer(playerRef.current).setup({
+        file: videoUrl,
+        image: poster,
+        autostart: autoplay,
+        controls: true,
+        responsive: true,
       });
 
-      const updateLocalMediaLocation = (position: number, duration: number) => {
-        const videoFile = playlist[player.getPlaylistIndex()];
-        if (videoFile && isInitialSeekDone && lastPlayedId === player.getPlaylistIndex()) {
-          const location = position === duration ? 0 : position;
-          if (videoFile.latest_media_location == null) videoFile.latest_media_location = { location };
-          else videoFile.latest_media_location.location = location;
+      playerInstance.on('ready', () => {
+        playerRef.current?.setAttribute('data-testid', 'jwplayer-ready');
+        setPlayer(playerInstance);
+      });
+
+      playerInstance.on('time', (event: any) => {
+        lastKnownPositionRef.current = event.position || 0;
+        lastKnownDurationRef.current = event.duration || 0;
+      });
+
+      playerInstance.on('error', (event: any) => {
+        if (event.code === 403 || event.code === 410) {
+          debouncedReloadAndResume();
+        }
+      });
+
+      playerInstance.on('buffer', () => {
+        if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+        stallTimerRef.current = setTimeout(() => {
+          if (playerInstance.getState && playerInstance.getState() === 'buffering') {
+            debouncedReloadAndResume();
+          }
+        }, 5000);
+      });
+
+      playerInstance.on('playing', () => {
+        if (stallTimerRef.current) {
+          clearTimeout(stallTimerRef.current);
+          stallTimerRef.current = null;
+        }
+      });
+
+      playerInstance.on('idle', () => {
+        const pos = lastKnownPositionRef.current;
+        const dur = lastKnownDurationRef.current;
+        if (pos > 0 && dur > 0 && pos < dur - 10) {
+          debouncedReloadAndResume();
+        }
+      });
+
+      const handleVisibilityChange = () => {
+        if (document.hidden) {
+          hiddenAtRef.current = Date.now();
+          return;
+        }
+        const t = hiddenAtRef.current;
+        hiddenAtRef.current = null;
+        if (t && Date.now() - t >= 300000) {
+          debouncedReloadAndResume();
         }
       };
 
-      const trackMediaLocation = (position: number) => {
-        if (purchase_id != null) {
-          const videoFile = playlist[player.getPlaylistIndex()];
-          if (!videoFile) return;
-          void trackMediaLocationChanged({
-            urlRedirectId: url_redirect_id,
-            productFileId: videoFile.external_id,
-            purchaseId: purchase_id,
-            location:
-              videoFile.content_length != null && position > videoFile.content_length
-                ? videoFile.content_length
-                : position,
-          });
-        }
+      document.addEventListener('visibilitychange', handleVisibilityChange);
+
+      const reloadAndResume = () => {
+        if (recoveringRef.current) return;
+        if (recoveryAttemptsRef.current >= 3) return;
+        recoveringRef.current = true;
+        recoveryAttemptsRef.current += 1;
+        (window as any).__RECOVERY_ATTEMPTS__ = recoveryAttemptsRef.current;
+        const item = playerInstance.getPlaylistItem();
+        const pos = lastKnownPositionRef.current;
+        playerInstance.load([item]);
+        playerInstance.once('ready', () => {
+          if (pos > 0) playerInstance.seek(pos);
+          playerInstance.play(true);
+          recoveringRef.current = false;
+        });
       };
 
-      const throttledTrackMediaLocation = throttle(trackMediaLocation, LOCATION_TRACK_EVENT_DELAY_MS);
+      const debouncedReloadAndResume = debounce(reloadAndResume, 250);
 
-      player.on("ready", () => {
-        player.playlistItem(index_to_play);
-      });
+      return () => {
+        playerInstance.remove();
+        document.removeEventListener('visibilitychange', handleVisibilityChange);
+        if (stallTimerRef.current) clearTimeout(stallTimerRef.current);
+        debouncedReloadAndResume.cancel();
+      };
+    }
+  }, [videoUrl, poster]);
 
-      player.on("seek", (ev) => {
-        trackMediaLocation(ev.offset);
-        updateLocalMediaLocation(ev.offset, player.getDuration());
-      });
-
-      player.on("time", (ev) => {
-        throttledTrackMediaLocation(ev.position);
-        updateLocalMediaLocation(ev.position, ev.duration);
-      });
-
-      player.on("complete", () => {
-        throttledTrackMediaLocation.cancel();
-        const videoFile = playlist[player.getPlaylistIndex()];
-        if (!videoFile) return;
-        trackMediaLocation(videoFile.content_length === null ? player.getDuration() : videoFile.content_length);
-        updateLocalMediaLocation(player.getDuration(), player.getDuration());
-      });
-
-      player.on("play", () => {
-        const itemId = player.getPlaylistIndex();
-        const videoFile = playlist[itemId];
-        if (videoFile !== undefined && lastPlayedId !== itemId) {
-          void createConsumptionEvent({
-            eventType: "watch",
-            urlRedirectId: url_redirect_id,
-            productFileId: videoFile.external_id,
-            purchaseId: purchase_id,
-          });
-          lastPlayedId = itemId;
-          isInitialSeekDone = false;
-        }
-      });
-
-      player.on("visualQuality", () => {
-        if (isInitialSeekDone && lastPlayedId === player.getPlaylistIndex()) return;
-        const videoFile = playlist[player.getPlaylistIndex()];
-        if (
-          videoFile?.latest_media_location != null &&
-          videoFile.latest_media_location.location !== videoFile.content_length
-        ) {
-          player.seek(videoFile.latest_media_location.location);
-        }
-        isInitialSeekDone = true;
-      });
-    };
-
-    void createPlayer();
-  });
-
-  return (
-    <>
-      {should_show_transcoding_notice ? (
-        <TranscodingNoticeModal transcodeOnFirstSale={transcode_on_first_sale} />
-      ) : null}
-      <div ref={containerRef} className="absolute h-full w-full"></div>
-    </>
-  );
+  return <div ref={playerRef} id="gumroad-player" />;
 };
-
-export default register({ component: VideoStreamPlayer, propParser: createCast() });
